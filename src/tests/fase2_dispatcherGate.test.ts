@@ -1,0 +1,183 @@
+/**
+ * fase2_dispatcherGate.test.ts — Test F2-T1 (Fase 2, Blueprint v2.0.0)
+ *
+ * Menguji Dispatcher Gate Lock di Hulu Pipeline:
+ *  - Host-Governed Invariant (DoD #1): seluruh mutasi disk dan eksekusi
+ *    subprocess tertolak mekanis di level dispatcher selama Plan Mode aktif.
+ *  - Flag /yolo terbukti TIDAK MAMPU membatalkan batasan plan mode.
+ *  - Tool read-only tetap diizinkan di Plan Mode.
+ *  - Integrasi end-to-end via runToolCall.
+ */
+import assert from 'node:assert/strict';
+import { describe, test } from 'node:test';
+import {
+  evaluateDispatcherGate,
+  isPlanModeBlockedTool,
+  MUTATION_AND_SUBPROCESS_TOOLS,
+} from '../core/dispatcher/dispatcherGate.js';
+import { runToolCall } from '../agent/tools.js';
+import type { HostState } from '../core/state/hostState.js';
+import { ScopeAmendmentManager } from '../core/approval/scopeAmendment.js';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DEFAULT_CONFIG } from '../types.js';
+
+function makeState(mode: 'plan' | 'act'): HostState {
+  return {
+    sessionId: 'session-gate-01',
+    mode,
+    activePlanHash: null,
+    approvalScope: null,
+    sessionTokenHash: 'token-abc',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+describe('F2-T1 Dispatcher Gate Lock', () => {
+  test('deprecated yoloMode is never read for PLAN, ACT scope, or read-only decisions', async () => {
+    for (const mode of ['plan', 'act'] as const) {
+      const hostState = makeState(mode);
+      const scopeManager = new ScopeAmendmentManager(hostState, process.cwd(), { isTTY: false });
+      for (const tool of ['write_file', 'read_file']) {
+        const decision = await evaluateDispatcherGate({
+          tool, hostState, scopeManager, args: { path: 'test.txt' },
+          get yoloMode(): boolean { throw new Error('dispatcher must not read approval policy'); },
+        });
+        assert.equal(decision.allowed, tool === 'read_file');
+      }
+    }
+  });
+
+  test('tool dispatch does not read approval config before the PLAN gate', async () => {
+    const result = JSON.parse(await runToolCall({ tool: 'write_file', path: 'blocked.txt', content: 'x' }, {
+      hostState: makeState('plan'),
+      config: {
+        get approvalEnabled(): boolean { throw new Error('unused YOLO derivation'); },
+      } as any,
+    }));
+    assert.match(result.error, /plan mode aktif/);
+  });
+
+  test('isPlanModeBlockedTool mencakup seluruh tool mutasi disk & subprocess', () => {
+    const requiredTools = [
+      'exec',
+      'start_process',
+      'write_file',
+      'edit_file',
+      'patch_file',
+      'delete_file',
+      'move_file',
+      'revert_file',
+      'remember',
+      'save_skill',
+      'delete_skill',
+    ];
+    for (const t of requiredTools) {
+      assert.ok(isPlanModeBlockedTool(t), `tool ${t} harus terdaftar sebagai blocked di plan mode`);
+      assert.ok(MUTATION_AND_SUBPROCESS_TOOLS.has(t));
+    }
+  });
+
+  test('DoD #1: seluruh tool mutasi dan subprocess tertolak di level dispatcher saat Plan Mode aktif', async () => {
+    const state = makeState('plan');
+    for (const tool of MUTATION_AND_SUBPROCESS_TOOLS) {
+      const decision = await evaluateDispatcherGate({
+        tool,
+        hostState: state,
+        args: { path: 'src/main.ts', command: 'echo hello' },
+      });
+      assert.equal(decision.allowed, false, `Tool ${tool} seharusnya ditolak dalam plan mode`);
+      assert.ok(
+        decision.reason?.includes('plan mode aktif'),
+        `Alasan penolakan harus jelas: ${decision.reason}`,
+      );
+    }
+  });
+
+  test('DoD #1: flag /yolo (yoloMode: true) TIDAK MAMPU membypass Plan Mode lock', async () => {
+    const state = makeState('plan');
+    const decisionExec = await evaluateDispatcherGate({
+      tool: 'exec',
+      hostState: state,
+      yoloMode: true,
+      args: { command: 'rm -rf /tmp/test' },
+    });
+    assert.equal(decisionExec.allowed, false, 'exec dengan yoloMode tetap harus ditolak di plan mode');
+
+    const decisionWrite = await evaluateDispatcherGate({
+      tool: 'write_file',
+      hostState: state,
+      yoloMode: true,
+      args: { path: 'test.txt', content: 'test' },
+    });
+    assert.equal(decisionWrite.allowed, false, 'write_file dengan yoloMode tetap harus ditolak di plan mode');
+  });
+
+  test('Tool read-only diizinkan di Plan Mode', async () => {
+    const state = makeState('plan');
+    const readOnlyTools = ['read_file', 'list_dir', 'code_search', 'glob', 'web_fetch'];
+    for (const tool of readOnlyTools) {
+      const decision = await evaluateDispatcherGate({
+        tool,
+        hostState: state,
+        args: { path: 'README.md' },
+      });
+      assert.equal(decision.allowed, true, `Tool read-only ${tool} harus diizinkan di plan mode`);
+    }
+  });
+
+  test('Integrasi via runToolCall: hostState mode plan menolak mutasi dan subprocess', async () => {
+    const state = makeState('plan');
+    const execResRaw = await runToolCall(
+      { tool: 'exec', command: 'echo 123' },
+      { hostState: state },
+    );
+    const execRes = JSON.parse(execResRaw);
+    assert.ok(execRes.error?.includes('plan mode aktif'));
+
+    const writeResRaw = await runToolCall(
+      { tool: 'write_file', path: 'danger.txt', content: 'payload' },
+      { hostState: state },
+    );
+    const writeRes = JSON.parse(writeResRaw);
+    assert.ok(writeRes.error?.includes('plan mode aktif'));
+  });
+
+  test('Integrasi via runToolCall: hostState mode plan + config approvalEnabled:false (YOLO) tetap tertolak', async () => {
+    const state = makeState('plan');
+    const resRaw = await runToolCall(
+      { tool: 'exec', command: 'rm -rf target' },
+      { hostState: state, config: { approvalEnabled: false } as any },
+    );
+    const res = JSON.parse(resRaw);
+    assert.ok(res.error?.includes('plan mode aktif'), 'YOLO config tidak boleh membypass plan mode di runToolCall');
+  });
+
+  test('revert_file target alias is scope-checked using the path the handler executes', async (t) => {
+    const ws = mkdtempSync(join(tmpdir(), 'ruko-revert-target-gate-'));
+    t.after(() => rmSync(ws, { recursive: true, force: true }));
+    mkdirSync(join(ws, 'src'));
+    mkdirSync(join(ws, 'outside'));
+    const state = makeState('act');
+    state.approvalScope = {
+      planHash: 'hash-revert', allowedPaths: ['src'],
+      approvedAt: new Date().toISOString(), correlationId: 'revert-gate',
+    };
+    state.activePlanHash = 'hash-revert';
+    const manager = new ScopeAmendmentManager(state, ws, { isTTY: false });
+    const result = JSON.parse(await runToolCall({
+      tool: 'revert_file', target: 'outside/secret.txt',
+    }, {
+      workspaceRoot: ws, hostState: state, scopeAmendmentManager: manager,
+      config: { ...DEFAULT_CONFIG, approvalEnabled: false },
+    })) as { error?: string };
+    assert.match(result.error ?? '', /SCOPE_OUTSIDE/);
+
+    const decision = await evaluateDispatcherGate({
+      tool: 'revert_file', args: { path: 'src/decoy.txt', target: 'outside/secret.txt' },
+      hostState: state, scopeManager: manager, isInteractive: false, workspaceRoot: ws,
+    });
+    assert.equal(decision.allowed, true, 'gate uses path alias precedence exactly as revert_file handler does');
+  });
+});

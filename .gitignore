@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.ruko/
+.kuro/
+*.log
+.env*
+.DS_Store
+
+# Lokal saja: berisi API key provider — JANGAN pernah di-push.
+opencode.json
+# Harness PTY (python)
+__pycache__/
+
+# Catatan & instruksi lokal (jangan push file personal)
+feedback.txt
+halo.txt
+ask.md
+Fee.py
+py.py
+bot.log
+bot_log.txt
+LAPORAN_TASK05_06.md
+ADIT.md
+UCUP.md
+alex.py
+Red.md
+# Berkas internal QA & Blueprint perencanaan
+QA.md
+!docs/internal/QA.md
+v2.0.0-blueprint
+

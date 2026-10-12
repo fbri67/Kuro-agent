@@ -1,0 +1,1465 @@
+import { AgentConfig, ContextMessage, ReasoningLevel } from '../types.js';
+import { isHostnameOrSubdomain } from '../core/config.js';
+import { parseToolCalls } from './tools.js';
+import { getProductEnv } from '../core/envCompat.js';
+
+/**
+ * Kuro ships NO provider default: base URL and model are whatever the user
+ * configured (config file or env). The wizard requires them explicitly so the
+ * CLI never promotes a specific provider on its own (§1).
+ */
+
+/**
+ * Names of the settings still missing after config-file + env resolution.
+ * Empty array means the provider is fully configured.
+ */
+export function missingConfigFields(
+  cfg: { apiKey?: string; baseUrl?: string; model?: string },
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const missing: string[] = [];
+  if (!((cfg.apiKey || env.KURO_API_KEY || env.RUKO_API_KEY || env.OPENAI_API_KEY || '').trim())) missing.push('apiKey');
+  if (!((cfg.baseUrl || env.OPENAI_BASE_URL || '').trim())) missing.push('baseUrl');
+  if (!((cfg.model || env.AGENT_MODEL || env.OPENAI_MODEL || '').trim())) missing.push('model');
+  return missing;
+}
+
+/** Tunables for automatic retry on provider rate limits (§7). */
+export interface RetryOptions {
+  /** Extra attempts after the first 429/503 response (default 2). */
+  retries?: number;
+  /** First backoff step in ms; doubles each attempt (default 1000). */
+  baseDelayMs?: number;
+  /** Upper bound for a single backoff step (default 15000). */
+  maxDelayMs?: number;
+  /** Injectable sleep (tests pass a no-op). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** HTTP statuses worth retrying — transient by nature. */
+const RETRYABLE_STATUSES = new Set([429, 503]);
+
+/** Exponential backoff: attempt 1 → base, 2 → 2×base, 3 → 4×base (capped). */
+export function backoffDelay(attempt: number, baseMs = 1000, maxMs = 15_000): number {
+  return Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt - 1));
+}
+
+/** Parses a `Retry-After` header (delta-seconds or HTTP date) into ms. */
+export function parseRetryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const date = Date.parse(trimmed);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+export interface ChatOptions {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  /** Called with every text token as it streams in (real-time reveal). */
+  onToken?: (token: string) => void;
+  /** Called with reasoning / thinking token chunks (without logging per chunk). */
+  onThought?: (thought: string) => void;
+  /**
+   * v0.7 live input: aborts the in-flight request (fetch + stream reader)
+   * when the user interrupts the turn.
+   */
+  signal?: AbortSignal;
+  /** Level reasoning sesi (Fase 2: /reasoning) → parameter native per provider. */
+  reasoning?: ReasoningLevel;
+}
+
+/*
+ * ============================================================================
+ * MAPPING PASTI Fase 2: level reasoning → parameter API per provider.
+ * Hanya field yang benar-benar dikirim di payload provider di bawah — jangan
+ * invent field lain. Level native didahulukan; fallback prompt injection hanya
+ * untuk provider tanpa parameter native / yang menolaknya (400).
+ * ============================================================================
+ */
+
+/** Urutan kekuatan reasoning: low < medium < high. */
+export const REASONING_LEVELS: ReasoningLevel[] = ['low', 'medium', 'high'];
+
+/**
+ * Normalizes reasoning level string (with backward compatibility for legacy
+ * 'xhigh', 'max', 'extreme' clamped to 'high').
+ */
+export function normalizeReasoningLevel(raw: unknown): ReasoningLevel {
+  if (typeof raw !== 'string') return 'medium';
+  const lower = raw.trim().toLowerCase();
+  if (lower === 'low') return 'low';
+  if (lower === 'high' || lower === 'xhigh' || lower === 'max' || lower === 'extreme') return 'high';
+  return 'medium';
+}
+
+/**
+ * OpenAI-compatible: field top-level `reasoning_effort` di body /chat/completions.
+ * Nilai yang didukung API OpenAI: 'low' | 'medium' | 'high'.
+ */
+export function toOpenAiReasoningEffort(level: ReasoningLevel | string): 'low' | 'medium' | 'high' {
+  switch (level) {
+    case 'low':
+      return 'low';
+    case 'high':
+    case 'xhigh':
+    case 'max':
+    case 'extreme':
+      return 'high';
+    case 'medium':
+    default:
+      return 'medium';
+  }
+}
+
+/**
+ * Anthropic: field top-level `thinking: { type: 'enabled', budget_tokens }`.
+ * Range API: 1024–128000 (integer). Mapping: 2048 (low) / 8192 (medium) / 16384 (high).
+ */
+export function toAnthropicBudgetTokens(level: ReasoningLevel | string): number {
+  switch (level) {
+    case 'low':
+      return 2048;
+    case 'high':
+    case 'xhigh':
+    case 'max':
+    case 'extreme':
+      return 16384;
+    case 'medium':
+    default:
+      return 8192;
+  }
+}
+
+/**
+ * Gemini: field top-level `thinkingConfig: { thinkingBudget }`.
+ * Range API: 0–24576. Mapping: 2048 (low) / 8192 (medium) / 24576 (high).
+ */
+export function toGeminiThinkingBudget(level: ReasoningLevel | string): number {
+  switch (level) {
+    case 'low':
+      return 2048;
+    case 'high':
+    case 'xhigh':
+    case 'max':
+    case 'extreme':
+      return 24576;
+    case 'medium':
+    default:
+      return 8192;
+  }
+}
+
+/**
+ * Fallback prompt-injection: dipakai HANYA jika provider
+ * TIDAK punya parameter reasoning native atau menolaknya (400).
+ * Template per level: Low / Medium / High.
+ */
+export function reasoningPromptAddendum(level: ReasoningLevel | string): string {
+  switch (level) {
+    case 'low':
+      return 'REASONING DEPTH — LOW: think briefly before acting; state a concise plan and proceed directly.';
+    case 'high':
+    case 'xhigh':
+    case 'max':
+    case 'extreme':
+      return 'REASONING DEPTH — HIGH: analyze the problem thoroughly before acting; consider alternatives, edge cases, and verify assumptions carefully.';
+    case 'medium':
+    default:
+      return 'REASONING DEPTH — MEDIUM: reason step by step before acting; state a clear plan and verify assumptions, keeping reasoning focused.';
+  }
+}
+
+/** Sisipkan instruksi depth reasoning ke system prompt (fallback prompt injection). */
+export function withReasoningDirective(
+  messages: ContextMessage[],
+  level: ReasoningLevel,
+): ContextMessage[] {
+  const addendum = reasoningPromptAddendum(level);
+  const out = [...messages];
+  const idx = out.findIndex((m) => m.role === 'system');
+  if (idx >= 0) {
+    out[idx] = { ...out[idx], content: `${out[idx].content}\n\n${addendum}` };
+    return out;
+  }
+  out.unshift({ role: 'system', content: addendum, timestamp: new Date().toISOString() });
+  return out;
+}
+
+/** Penanda sekali-jalan: log debug HANYA sekali saat fallback reasoning aktif. */
+export class ReasoningFallbackLog {
+  private logged = false;
+
+  note(reason: string): void {
+    if (this.logged) return;
+    this.logged = true;
+    if (process.env.DEBUG || getProductEnv('DEBUG')) {
+      console.error(
+        `[DEBUG] Parameter reasoning native tidak didukung (${reason}) — fallback ke prompt injection; request tetap dilanjutkan.`,
+      );
+    }
+  }
+}
+
+/** Abstraction over any chat-completion backend the agent can talk to. */
+export interface LLMProvider {
+  readonly name: string;
+  /** True when the backend can actually be called (e.g. API key present). */
+  readonly isConfigured: boolean;
+  /** The currently active model name. */
+  readonly model: string;
+  /** Finish reason of the most recent completion (e.g. 'stop', 'length', 'tool_calls'). */
+  lastFinishReason?: string | null;
+  /** Buffered reasoning text from the most recent completion (if provider returns reasoning). */
+  lastReasoning?: string | null;
+  /** Switches the active model at runtime (e.g. via /model). */
+  setModel(model: string): void;
+  /** Applies new API credentials at runtime (e.g. after `/config setup`). */
+  setCredentials?(apiKey: string, baseUrl: string): void;
+  /** Live connectivity probe used by the wizard (§2: test right after keys). */
+  testConnection?(): Promise<ConnectionResult>;
+  /** Model ids from the endpoint's /models listing (empty when unsupported). */
+  listModels?(): Promise<string[]>;
+  chat(messages: ContextMessage[], options?: ChatOptions): Promise<string>;
+}
+
+export interface ConnectionResult {
+  ok: boolean;
+  /** On success: model echoed back / endpoint name; on failure: human reason. */
+  message: string;
+}
+
+/**
+ * Redacts secrets (API keys, query token params, auth headers) from text or URLs.
+ */
+export function sanitizeSensitiveText(text: string, secretKey?: string): string {
+  if (!text) return text;
+  let sanitized = text;
+  if (secretKey && secretKey.trim().length > 0) {
+    const raw = secretKey.trim();
+    sanitized = sanitized.split(raw).join('••••••••');
+    const encoded = encodeURIComponent(raw);
+    if (encoded !== raw) {
+      sanitized = sanitized.split(encoded).join('••••••••');
+    }
+  }
+  return sanitized
+    .replace(/([?&](?:key|api_key|token)=)[^&\s"'`]+/gi, '$1••••••••')
+    .replace(/(x-goog-api-key|x-api-key|authorization)\s*[:=]\s*([^\s"'`]+)/gi, '$1: ••••••••');
+}
+
+/**
+ * Ensures Error instances do not carry unredacted credentials in their message or stack.
+ */
+export function sanitizeError(err: unknown, secretKey?: string): Error {
+  if (err instanceof Error) {
+    const cleanMsg = sanitizeSensitiveText(err.message, secretKey);
+    if (cleanMsg !== err.message) {
+      const sanitizedErr = new Error(cleanMsg);
+      sanitizedErr.name = err.name;
+      if (err.stack) {
+        sanitizedErr.stack = sanitizeSensitiveText(err.stack, secretKey);
+      }
+      return sanitizedErr;
+    }
+    return err;
+  }
+  return new Error(sanitizeSensitiveText(String(err), secretKey));
+}
+
+/**
+ * Translates raw transport/HTTP failures into beginner-proof explanations
+ * with the fix command inline (§2: "pesan error yang menerjemahkan").
+ */
+export function explainProviderError(err: unknown): string {
+  const rawText = err instanceof Error ? err.message : String(err);
+  const text = sanitizeSensitiveText(rawText);
+  const status = text.match(/\b(400|401|403|404|429|500|502|503)\b/)?.[1];
+  switch (status) {
+    case '400':
+      return 'Request ditolak provider (400) — kemungkinan parameter internal Kuro tidak didukung model/endpoint ini. Coba `/model` lain atau periksa baseUrl.';
+    case '401':
+      return 'API key salah atau kedaluwarsa (401) — perbaiki dengan /login (atau ganti /profile).';
+    case '403':
+      return 'Akses ditolak (403) — API key tidak punya izin untuk model ini. Cek kuota/izin akun atau ganti /profile.';
+    case '404':
+      return 'Model tidak ditemukan (404) — cek nama (`/model <nama>`) atau baseUrl (`/config set baseUrl <url>`).';
+    case '429':
+      return 'Rate limit (429) — terlalu banyak permintaan. Kuro mencoba ulang otomatis; jika tetap gagal, tunggu sebentar atau ganti /profile.';
+    case '500':
+    case '502':
+    case '503':
+      return `Server provider sedang bermasalah (${status}) — coba lagi sebentar lagi.`;
+    default:
+      break;
+  }
+  if (/ECONNREFUSED|ENOTFOUND|fetch failed|EAI_AGAIN/i.test(text)) {
+    if (/localhost|127\.0\.0\.1|::1/.test(text)) {
+      return 'Server lokal belum jalan — contoh: jalankan `ollama serve` lalu coba lagi.';
+    }
+    return 'Server tidak bisa dihubungi — cek baseUrl (`/config set baseUrl <url>`) dan koneksi internet.';
+  }
+  if (/timeout|ETIMEDOUT|AbortError/i.test(text)) {
+    return 'Percobaan habis waktu — server lambat atau baseUrl salah (`/config set baseUrl <url>`).';
+  }
+  return `Koneksi gagal: ${text}`;
+}
+
+/**
+ * Sanitizes and validates the integrity of a 'tool' role message payload (Tugas 7).
+ * Prevents syntax confusion or token bleed when payload is empty or truncated.
+ */
+export function sanitizeToolMessageContent(content: string | null | undefined, toolName?: string): string {
+  if (content === null || content === undefined) {
+    return `[Hasil tool "${toolName ?? 'unknown'}" kosong]`;
+  }
+  const str = typeof content === 'string' ? content : String(content);
+  const trimmed = str.trim();
+  if (trimmed.length === 0) {
+    return `[Hasil tool "${toolName ?? 'unknown'}" kosong]`;
+  }
+
+  let sanitized = str;
+
+  // 1. Detect unclosed markdown code blocks (e.g. ``` without closing ```)
+  const fenceMatches = sanitized.match(/```/g);
+  if (fenceMatches && fenceMatches.length % 2 !== 0) {
+    sanitized += '\n```\n[Catatan: Output blok kode terpotong / truncated code block]';
+  }
+
+  // 2. Detect truncated JSON payloads: starts with { or [ but does not end with } or ]
+  if ((trimmed.startsWith('{') && !trimmed.endsWith('}')) || (trimmed.startsWith('[') && !trimmed.endsWith(']'))) {
+    sanitized += '\n[Peringatan: Payload JSON tool terpotong / truncated JSON payload]';
+  }
+
+  return sanitized;
+}
+
+/**
+ * Item 4 & Tugas 7: Validasi dan Sanitasi Pesan OpenAI-Compatible
+ * Memastikan invariant struktur pesan terjaga: setiap pesan role `assistant` yang berisi array `tool_calls`
+ * wajib disusul secara lengkap dan berurutan oleh pesan role `tool` untuk setiap `tool_call_id` terkait,
+ * serta memeriksa integritas payload pesan tool (sanitasi payload kosong atau terpotong).
+ */
+export function validateOpenAiMessages<T extends { role: string; content?: string | null; tool_calls?: any[]; tool_call_id?: string; name?: string }>(
+  messages: T[],
+): T[] {
+  const result: T[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i];
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      result.push(msg);
+      i += 1;
+      // Kumpulkan seluruh pesan role tool yang langsung menyusul
+      const toolMsgs: T[] = [];
+      while (i < messages.length && messages[i].role === 'tool') {
+        toolMsgs.push(messages[i]);
+        i += 1;
+      }
+      // Pastikan setiap tool_call_id memiliki pesan tool yang berurutan sesuai urutan di tool_calls
+      for (const tc of msg.tool_calls) {
+        const id = tc.id;
+        const matchingIdx = toolMsgs.findIndex((tm) => tm.tool_call_id === id);
+        if (matchingIdx !== -1) {
+          const original = toolMsgs[matchingIdx];
+          const toolName = original.name ?? tc.function?.name;
+          const sanitizedContent = sanitizeToolMessageContent(original.content, toolName);
+          result.push({
+            ...original,
+            content: sanitizedContent,
+          });
+          toolMsgs.splice(matchingIdx, 1);
+        } else {
+          // Jika ada tool_call_id yang belum disusul, buat pesan tool pengganti yang valid
+          result.push({
+            role: 'tool',
+            tool_call_id: id,
+            content: `[Hasil tool "${tc.function?.name ?? id}" tidak ditemukan atau terlewat]`,
+            name: tc.function?.name,
+          } as T);
+        }
+      }
+      // Sisa pesan tool yang tidak memiliki pasangan id pada assistant ini dilewati agar tidak memicu error API
+      continue;
+    }
+
+    // Pesan role 'tool' tanpa didahului oleh pesan assistant dengan tool_calls yang valid dilewati (orphan tool message)
+    if (msg.role === 'tool') {
+      i += 1;
+      continue;
+    }
+
+    result.push(msg);
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * OpenAI-compatible chat completions provider (works with OpenAI and any
+ * compatible endpoint such as Ollama, LM Studio, vLLM, ...).
+ *
+ * Credentials resolution (config file wins, env vars as fallback):
+ *   apiKey   — `apiKey` in .ruko/config.json, else OPENAI_API_KEY
+ *   baseUrl  — `baseUrl` in .ruko/config.json, else OPENAI_BASE_URL
+ *   model    — `model` in config, else AGENT_MODEL / OPENAI_MODEL
+ *
+ * Responses stream via SSE (`stream: true`); tokens are piped through
+ * `options.onToken` in real time and the full text is returned at the end.
+ */
+export class OpenAiCompatibleProvider implements LLMProvider {
+  readonly name = 'openai-compatible';
+  private apiKey: string;
+  private baseUrl: string;
+  private currentModel: string;
+  private readonly retry: RetryOptions;
+  lastFinishReason: string | null = null;
+  lastReasoning: string | null = null;
+  /** True setelah endpoint menolak `reasoning_effort` (Fase 2: fallback prompt injection). */
+  private reasoningParamUnsupported = false;
+  private reasoningFallbackLog = new ReasoningFallbackLog();
+
+  constructor(cfg: Partial<AgentConfig> = {}, retry: RetryOptions = {}) {
+    const rawKey = cfg.apiKey ?? getProductEnv('API_KEY') ?? process.env.OPENAI_API_KEY ?? '';
+    this.apiKey = rawKey.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const rawBase = cfg.baseUrl || process.env.OPENAI_BASE_URL || '';
+    this.baseUrl = rawBase.trim().replace(/^["'`]+|["'`]+$/g, '').trim().replace(/\/+$/, '');
+    const rawModel = cfg.model || process.env.AGENT_MODEL || process.env.OPENAI_MODEL || '';
+    this.currentModel = rawModel.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    this.retry = retry;
+  }
+
+  /**
+   * POST/GET with automatic exponential backoff on 429/503 so a long,
+   * unattended Kuro run rides out provider rate limits instead of dying (§7).
+   */
+  private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const retries = this.retry.retries ?? 2;
+    const base = this.retry.baseDelayMs ?? 1000;
+    const max = this.retry.maxDelayMs ?? 15_000;
+    const sleep =
+      this.retry.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    for (let attempt = 0; ; attempt += 1) {
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new Error('Aborted');
+      }
+      const response = await fetch(url, init);
+      if (response.ok || attempt >= retries || !RETRYABLE_STATUSES.has(response.status)) {
+        return response;
+      }
+      const retryAfter = parseRetryAfterMs(response.headers.get('retry-after'));
+      await sleep(retryAfter ?? backoffDelay(attempt + 1, base, max));
+    }
+  }
+
+  /** All three (key, URL, model) must be present before we call the backend. */
+  get isConfigured(): boolean {
+    return this.apiKey.length > 0 && this.baseUrl.length > 0 && this.currentModel.length > 0;
+  }
+
+  get model(): string {
+    return this.currentModel;
+  }
+
+  setModel(model: string): void {
+    const clean = model.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    this.currentModel = clean || this.currentModel;
+  }
+
+  setCredentials(apiKey: string, baseUrl: string): void {
+    const cleanKey = apiKey.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const cleanBase = baseUrl.trim().replace(/^["'`]+|["'`]+$/g, '').trim().replace(/\/+$/, '');
+    if (cleanKey) this.apiKey = cleanKey;
+    if (cleanBase) this.baseUrl = cleanBase;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${this.apiKey}`,
+    };
+  }
+
+  /**
+   * Probes the endpoint with a minimal non-streamed completion so the wizard
+   * can show "✓ Terhubung ke <model>" before the first real turn (§2).
+   */
+  async testConnection(): Promise<ConnectionResult> {
+    if (!this.isConfigured) {
+      const missing = missingConfigFields({
+        apiKey: this.apiKey,
+        baseUrl: this.baseUrl,
+        model: this.currentModel,
+      });
+      return { ok: false, message: `Belum lengkap: ${missing.join(', ')} — jalankan /login.` };
+    }
+    try {
+      const response = await this.requestWithRetry(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: JSON.stringify({
+          model: this.currentModel,
+          messages: [{ role: 'user', content: 'ping' }],
+          // Some providers reject tiny budgets ("max_tokens must be greater
+          // than 2"); a small but valid value keeps the probe portable (§1).
+          max_tokens: 16,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`LLM API error ${response.status}: ${body.slice(0, 200)}`);
+      }
+      return { ok: true, message: this.currentModel };
+    } catch (err) {
+      return { ok: false, message: explainProviderError(err) };
+    }
+  }
+
+  /** Auto-fetch model ids from /models (§2) — never force users to type names. */
+  async listModels(): Promise<string[]> {
+    const response = await fetch(`${this.baseUrl}/models`, {
+      headers: this.authHeaders(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`LLM API error ${response.status}: ${body.slice(0, 200)}`);
+    }
+    const data = (await response.json()) as { data?: Array<{ id?: string; name?: string }> };
+    return (data.data ?? [])
+      .map((m) => m.id ?? m.name ?? '')
+      .filter((id) => id.length > 0)
+      .sort();
+  }
+
+  async chat(messages: ContextMessage[], options?: ChatOptions): Promise<string> {
+    if (!this.isConfigured) {
+      const missing = missingConfigFields({
+        apiKey: this.apiKey,
+        baseUrl: this.baseUrl,
+        model: this.currentModel,
+      });
+      throw new Error(
+        `Konfigurasi belum lengkap (${missing.join(', ')}) — jalankan /login atau set OPENAI_API_KEY / OPENAI_BASE_URL / AGENT_MODEL.`,
+      );
+    }
+
+    this.lastFinishReason = null;
+
+    const reasoningLevel = options?.reasoning ?? null;
+    const useNativeReasoning = Boolean(reasoningLevel) && !this.reasoningParamUnsupported;
+
+    // Normalisasi & Validasi Skema Tool Result: Pastikan payload pesan balik setelah tool execution
+    // sesuai dengan skema standar provider (role: "tool" dengan tool_call_id yang valid)
+    // dan invariant struktur pesan OpenAI-compatible terjaga secara lengkap dan berurutan.
+    const formatMessages = (source: ContextMessage[]): Array<Record<string, unknown>> => {
+      const validated = validateOpenAiMessages(source);
+      return validated.map((m) => {
+        if (m.role === 'tool') {
+          const toolCallId = (m.tool_call_id && m.tool_call_id.trim()) || `call_${Date.now()}`;
+          return {
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: m.content,
+            ...(m.name ? { name: m.name } : {}),
+          };
+        }
+        const msgObj: Record<string, unknown> = {
+          role: m.role,
+          content: m.content,
+        };
+        if (m.tool_calls && m.tool_calls.length > 0) {
+          msgObj.tool_calls = m.tool_calls;
+        }
+        return msgObj;
+      });
+    };
+
+    const buildRequestBody = (withNative: boolean, omitTemperature = false): string => {
+      // Fallback prompt injection: dipakai saat parameter native tidak didukung.
+      const source =
+        reasoningLevel && !withNative ? withReasoningDirective(messages, reasoningLevel) : messages;
+      const model = options?.model ?? this.currentModel;
+      const isExplicitReasoningModel = /^(?:o1|o3|o4)/i.test(model);
+
+      const body: Record<string, unknown> = {
+        model,
+        messages: formatMessages(source),
+        max_tokens: options?.maxTokens ?? 2048,
+        stream: true,
+      };
+
+      // Model dengan reasoning bawaan (seperti o1, o3-mini) atau saat reasoning_effort native aktif
+      // tidak mendukung parameter 'temperature' di API OpenAI (mengakibatkan error 400).
+      if (!omitTemperature && !isExplicitReasoningModel && !(withNative && reasoningLevel)) {
+        body.temperature = options?.temperature ?? 0.3;
+      }
+
+      // Mapping level reasoning → parameter API reasoning_effort
+      if (withNative && reasoningLevel) {
+        body.reasoning_effort = toOpenAiReasoningEffort(reasoningLevel);
+      }
+
+      return JSON.stringify(body);
+    };
+
+    let response = await this.requestWithRetry(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: buildRequestBody(useNativeReasoning),
+      signal: options?.signal,
+    });
+
+    // Penanganan error 400:
+    // 1. Endpoint menolak `temperature` (mis. model dengan reasoning native yang belum terfilter di atas):
+    //    Retry sekali tanpa menyertakan parameter `temperature`.
+    // 2. Endpoint menolak `reasoning_effort` (mis. Ollama standar tanpa thinking):
+    //    Strip parameter native, retry sekali dengan fallback prompt injection.
+    if (!response.ok && response.status === 400) {
+      const errBody = await response.text();
+      if (/temperature/i.test(errBody)) {
+        response = await this.requestWithRetry(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: this.authHeaders(),
+          body: buildRequestBody(useNativeReasoning, true),
+          signal: options?.signal,
+        });
+      } else if (/reasoning/i.test(errBody) && useNativeReasoning && reasoningLevel) {
+        this.reasoningParamUnsupported = true;
+        this.reasoningFallbackLog.note('reasoning_effort');
+        response = await this.requestWithRetry(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: this.authHeaders(),
+          body: buildRequestBody(false, false),
+          signal: options?.signal,
+        });
+      } else {
+        throw new Error(`LLM API error ${response.status}: ${errBody.slice(0, 500)}`);
+      }
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`LLM API error ${response.status}: ${body.slice(0, 500)}`);
+    }
+
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('text/event-stream') || !response.body) {
+      // Endpoint ignored `stream` — parse the plain JSON completion instead.
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: string | null;
+            reasoning_content?: string | null;
+            reasoning?: string | null;
+            tool_calls?: Array<{
+              id?: string;
+              type?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+          finish_reason?: string | null;
+        }>;
+      };
+      this.lastFinishReason = data.choices?.[0]?.finish_reason ?? 'stop';
+      const msg = data.choices?.[0]?.message;
+      let content = msg?.content ?? '';
+      const reasoning = msg?.reasoning_content ?? msg?.reasoning;
+      this.lastReasoning = reasoning || null;
+      if (reasoning && options?.onThought) {
+        options.onThought(reasoning);
+      }
+      const apiToolCalls = msg?.tool_calls;
+      if (Array.isArray(apiToolCalls) && apiToolCalls.length > 0) {
+        // Solusi 1 (jalur non-streaming): dedup identik dengan jalur streaming di
+        // bawah. Model bisa menuliskan tool call dua kali — sekali sebagai fence
+        // ```tool di content, sekali via tool_calls native API. Tanpa dedup,
+        // blok identik disintesis ulang, parseToolCalls menghasilkan batch
+        // ganda, dan loop detector mem-flag "Perintah identik terdeteksi
+        // berulang" pada panggilan pertama di sesi baru (false-positive).
+        const existingCalls = parseToolCalls(content).calls;
+        for (const tc of apiToolCalls) {
+          const fnName = tc.function?.name;
+          if (fnName) {
+            let fnArgs: Record<string, unknown> = {};
+            try {
+              fnArgs = JSON.parse(tc.function?.arguments || '{}');
+            } catch {
+              // fallback
+            }
+            // Signature normalisasi sama persis dengan jalur streaming:
+            // nama lowercased tanpa underscore + argumen JSON-serialisasi.
+            const normName = fnName.toLowerCase().replace(/_/g, '');
+            const candidateSig = `${normName}:${JSON.stringify(fnArgs)}`;
+            const alreadyInContent = existingCalls.some((ec) => {
+              const { id: _eId, tool: ecTool, ...ecRest } = ec;
+              const normEcTool = (ecTool ?? '').toLowerCase().replace(/_/g, '');
+              return `${normEcTool}:${JSON.stringify(ecRest)}` === candidateSig;
+            });
+            if (!alreadyInContent) {
+              const toolObj: Record<string, unknown> = { tool: fnName, ...fnArgs };
+              if (tc.id) toolObj.id = tc.id;
+              content += `\n\`\`\`tool\n${JSON.stringify(toolObj)}\n\`\`\`\n`;
+            }
+          }
+        }
+      }
+      if (content) options?.onToken?.(content);
+      return content;
+    }
+
+    let full = '';
+    let buffer = '';
+    let reasoningBuffer = '';
+    const decoder = new TextDecoder();
+    const streamToolCalls: Map<number, { id?: string; name: string; args: string }> = new Map();
+
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      try {
+        const parsed = JSON.parse(payload) as {
+          choices?: Array<{
+            delta?: {
+              content?: string | null;
+              reasoning_content?: string | null;
+              reasoning?: string | null;
+              tool_calls?: Array<{
+                index?: number;
+                id?: string;
+                type?: string;
+                function?: { name?: string; arguments?: string };
+              }>;
+            };
+            finish_reason?: string | null;
+          }>;
+        };
+        const finishReason = parsed.choices?.[0]?.finish_reason;
+        if (finishReason) {
+          this.lastFinishReason = finishReason;
+        }
+        const delta = parsed.choices?.[0]?.delta;
+        const reasoningToken = delta?.reasoning_content ?? delta?.reasoning;
+        if (reasoningToken) {
+          reasoningBuffer += reasoningToken;
+          if (options?.onThought) {
+            options.onThought(reasoningToken);
+          }
+        }
+        const token = delta?.content;
+        if (token) {
+          full += token;
+          options?.onToken?.(token);
+        }
+        if (Array.isArray(delta?.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            const existing = streamToolCalls.get(idx) ?? { name: '', args: '' };
+            if (tc.id) existing.id = tc.id;
+            if (tc.function?.name) existing.name += tc.function.name;
+            if (tc.function?.arguments) existing.args += tc.function.arguments;
+            streamToolCalls.set(idx, existing);
+          }
+        }
+      } catch {
+        // Keep-alive or malformed SSE frame — ignore.
+      }
+    };
+
+    // Stream Ingestion Hardening: simpan sisa chunk yang belum newline lengkap ke buffer lokal
+    // sebelum di-parse JSON agar teks streaming tidak terpotong di tengah kalimat.
+    for await (const raw of response.body as AsyncIterable<Uint8Array>) {
+      buffer += decoder.decode(raw, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      for (const line of lines) processLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      for (const line of buffer.split(/\r?\n/)) processLine(line);
+    }
+    this.lastReasoning = reasoningBuffer || null;
+    if (streamToolCalls.size > 0) {
+      const existingCalls = parseToolCalls(full).calls;
+      for (const [, tc] of streamToolCalls) {
+        if (tc.name) {
+          let parsedArgs: Record<string, unknown> = {};
+          try {
+            parsedArgs = JSON.parse(tc.args || '{}');
+          } catch {
+            // fallback
+          }
+
+          // Solusi 1: De-duplikasi level stream.
+          // Jika delta.content sudah mencetak pemanggilan tool yang sama
+          // (misal via blok ```tool atau DSML), jangan tambahkan sintesis duplikat.
+          const normName = tc.name.toLowerCase().replace(/_/g, '');
+          const candidateSig = `${normName}:${JSON.stringify(parsedArgs)}`;
+          const alreadyInFull = existingCalls.some((ec) => {
+            const { id: _eId, tool: ecTool, ...ecRest } = ec;
+            const normEcTool = (ecTool ?? '').toLowerCase().replace(/_/g, '');
+            return `${normEcTool}:${JSON.stringify(ecRest)}` === candidateSig;
+          });
+
+          if (!alreadyInFull) {
+            const toolObj: Record<string, unknown> = { tool: tc.name, ...parsedArgs };
+            if (tc.id) toolObj.id = tc.id;
+            full += `\n\`\`\`tool\n${JSON.stringify(toolObj)}\n\`\`\`\n`;
+          }
+        }
+      }
+    }
+    if (!this.lastFinishReason) {
+      this.lastFinishReason = 'stop';
+    }
+    return full;
+  }
+}
+
+export const DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com/v1';
+
+/**
+ * Sanitizes an Anthropic base URL: strips quotes, trims whitespace,
+ * removes trailing slashes, and defaults to https://api.anthropic.com/v1.
+ */
+export function sanitizeAnthropicBaseUrl(url?: string | null): string {
+  if (!url) return DEFAULT_ANTHROPIC_BASE_URL;
+  const unquoted = url.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!unquoted) return DEFAULT_ANTHROPIC_BASE_URL;
+  const clean = unquoted.replace(/\/+$/, '');
+  if (clean === 'https://api.anthropic.com') {
+    return `${clean}/v1`;
+  }
+  return clean;
+}
+
+/**
+ * Anthropic Claude provider (messages API format).
+ */
+export class AnthropicProvider implements LLMProvider {
+  readonly name = 'anthropic';
+  private apiKey: string;
+  private baseUrl: string;
+  private currentModel: string;
+  private readonly retry: RetryOptions;
+  lastFinishReason: string | null = null;
+  lastReasoning: string | null = null;
+  /** True setelah endpoint menolak `thinking` (Fase 2: fallback prompt injection). */
+  private reasoningParamUnsupported = false;
+  private reasoningFallbackLog = new ReasoningFallbackLog();
+
+  constructor(cfg: Partial<AgentConfig> = {}, retry: RetryOptions = {}) {
+    this.apiKey = cfg.apiKey ?? process.env.ANTHROPIC_API_KEY ?? getProductEnv('API_KEY') ?? process.env.OPENAI_API_KEY ?? '';
+    const rawBase = cfg.baseUrl || process.env.ANTHROPIC_BASE_URL || '';
+    this.baseUrl = sanitizeAnthropicBaseUrl(rawBase);
+    this.currentModel = cfg.model || process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022';
+    this.retry = retry;
+  }
+
+  get isConfigured(): boolean {
+    return this.apiKey.length > 0 && this.baseUrl.length > 0 && this.currentModel.length > 0;
+  }
+
+  get model(): string {
+    return this.currentModel;
+  }
+
+  setModel(model: string): void {
+    this.currentModel = model.trim() || this.currentModel;
+  }
+
+  setCredentials(apiKey: string, baseUrl: string): void {
+    if (apiKey.trim()) this.apiKey = apiKey.trim();
+    if (baseUrl !== undefined) {
+      this.baseUrl = sanitizeAnthropicBaseUrl(baseUrl);
+    }
+  }
+
+  private authHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'x-api-key': this.apiKey,
+      'anthropic-version': '2023-06-01',
+    };
+  }
+
+  private buildEndpointUrl(endpoint = '/messages'): string {
+    const cleanBase = sanitizeAnthropicBaseUrl(this.baseUrl);
+    if (cleanBase.endsWith('/messages')) return cleanBase;
+    const cleanEndpoint = endpoint.replace(/^\/+/, '');
+    return `${cleanBase}/${cleanEndpoint}`;
+  }
+
+  private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const retries = this.retry.retries ?? 2;
+    const base = this.retry.baseDelayMs ?? 1000;
+    const max = this.retry.maxDelayMs ?? 15_000;
+    const sleep =
+      this.retry.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    for (let attempt = 0; ; attempt += 1) {
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new Error('Aborted');
+      }
+      const response = await fetch(url, init);
+      if (response.ok || attempt >= retries || !RETRYABLE_STATUSES.has(response.status)) {
+        return response;
+      }
+      const retryAfter = parseRetryAfterMs(response.headers.get('retry-after'));
+      await sleep(retryAfter ?? backoffDelay(attempt + 1, base, max));
+    }
+  }
+
+  async testConnection(): Promise<ConnectionResult> {
+    if (!this.isConfigured) {
+      return { ok: false, message: 'Anthropic API key belum diatur — set ANTHROPIC_API_KEY atau jalankan /login.' };
+    }
+    try {
+      const url = this.buildEndpointUrl('/messages');
+      const response = await this.requestWithRetry(url, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: JSON.stringify({
+          model: this.currentModel,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 16,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Anthropic API error ${response.status}: ${sanitizeSensitiveText(body.slice(0, 200), this.apiKey)}`);
+      }
+      return { ok: true, message: this.currentModel };
+    } catch (err) {
+      const sanitized = sanitizeError(err, this.apiKey);
+      return { ok: false, message: explainProviderError(sanitized) };
+    }
+  }
+
+  async listModels(): Promise<string[]> {
+    return [
+      'claude-3-5-sonnet-20241022',
+      'claude-3-5-haiku-20241022',
+      'claude-3-opus-20240229',
+    ];
+  }
+
+  async chat(messages: ContextMessage[], options?: ChatOptions): Promise<string> {
+    if (!this.isConfigured) {
+      throw new Error('Konfigurasi Anthropic belum lengkap (API key kosong) — jalankan /login atau set ANTHROPIC_API_KEY.');
+    }
+
+    const reasoningLevel = options?.reasoning ?? null;
+    const useNativeReasoning = Boolean(reasoningLevel) && !this.reasoningParamUnsupported;
+
+    const buildPayload = (withNative: boolean): Record<string, unknown> => {
+      // Fallback prompt injection: dipakai saat parameter native `thinking` tidak didukung.
+      const source =
+        reasoningLevel && !withNative ? withReasoningDirective(messages, reasoningLevel) : messages;
+      const systemParts: string[] = [];
+      const nonSystem: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+      for (const m of source) {
+        if (m.role === 'system') {
+          systemParts.push(m.content);
+        } else {
+          const role: 'user' | 'assistant' = (m.role === 'tool' || m.role === 'tool_call') ? 'user' : m.role;
+          if (nonSystem.length > 0 && nonSystem[nonSystem.length - 1].role === role) {
+            nonSystem[nonSystem.length - 1].content += '\n\n' + m.content;
+          } else {
+            nonSystem.push({ role, content: m.content });
+          }
+        }
+      }
+
+      if (nonSystem.length === 0) {
+        nonSystem.push({ role: 'user', content: 'Hello' });
+      }
+
+      const payload: Record<string, unknown> = {
+        model: options?.model ?? this.currentModel,
+        messages: nonSystem,
+        max_tokens: options?.maxTokens ?? 2048,
+        temperature: options?.temperature ?? 0.3,
+        stream: true,
+      };
+      if (systemParts.length > 0) {
+        payload.system = systemParts.join('\n\n');
+      }
+      if (withNative && reasoningLevel) {
+        // Mapping PASTI Fase 2: field top-level `thinking: { type: 'enabled', budget_tokens }`.
+        const budgetTokens = toAnthropicBudgetTokens(reasoningLevel);
+        payload.thinking = { type: 'enabled', budget_tokens: budgetTokens };
+        // Guard API extended thinking: hanya kompatibel dengan temperature 1,
+        // dan mensyaratkan max_tokens > budget_tokens.
+        payload.temperature = 1;
+        payload.max_tokens = Math.max(payload.max_tokens as number, budgetTokens + 1024);
+      }
+      return payload;
+    };
+
+    const url = this.buildEndpointUrl('/messages');
+
+    let response: Response;
+    try {
+      response = await this.requestWithRetry(url, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: JSON.stringify(buildPayload(useNativeReasoning)),
+        signal: options?.signal,
+      });
+
+      // Model/endpoint menolak `thinking` (mis. model tanpa extended thinking):
+      // JANGAN gagalkan request — strip parameter native, retry SEKALI dengan
+      // fallback prompt injection, lalu log sekali di level debug.
+      if (!response.ok && useNativeReasoning && reasoningLevel && response.status === 400) {
+        const errBody = await response.text();
+        if (/thinking|budget_tokens/i.test(errBody)) {
+          this.reasoningParamUnsupported = true;
+          this.reasoningFallbackLog.note('thinking.budget_tokens');
+          response = await this.requestWithRetry(url, {
+            method: 'POST',
+            headers: this.authHeaders(),
+            body: JSON.stringify(buildPayload(false)),
+            signal: options?.signal,
+          });
+        } else {
+          throw new Error(`Anthropic API error ${response.status}: ${sanitizeSensitiveText(errBody.slice(0, 500), this.apiKey)}`);
+        }
+      }
+    } catch (err) {
+      throw sanitizeError(err, this.apiKey);
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Anthropic API error ${response.status}: ${sanitizeSensitiveText(body.slice(0, 500), this.apiKey)}`);
+    }
+
+    this.lastFinishReason = null;
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('text/event-stream') || !response.body) {
+      try {
+        const data = (await response.json()) as {
+          content?: Array<{ type?: string; text?: string }>;
+          stop_reason?: string | null;
+        };
+        this.lastFinishReason = data.stop_reason ?? 'end_turn';
+        const text = data.content?.map((c) => c.text ?? '').join('') ?? '';
+        if (text) options?.onToken?.(text);
+        return text;
+      } catch (err) {
+        throw sanitizeError(err, this.apiKey);
+      }
+    }
+
+    let full = '';
+    let buffer = '';
+    let reasoningBuffer = '';
+    const decoder = new TextDecoder();
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const payloadStr = trimmed.slice(5).trim();
+      if (!payloadStr || payloadStr === '[DONE]') return;
+      try {
+        const parsed = JSON.parse(payloadStr) as {
+          type?: string;
+          error?: { type?: string; message?: string };
+          delta?: { type?: string; text?: string; thinking?: string; stop_reason?: string };
+          content_block?: { type?: string; text?: string; thinking?: string };
+        };
+        if (parsed.type === 'error' && parsed.error?.message) {
+          throw new Error(`Anthropic stream error: ${parsed.error.message}`);
+        }
+        if (parsed.delta?.stop_reason) {
+          this.lastFinishReason = parsed.delta.stop_reason;
+        }
+        const thinkingDelta =
+          parsed.delta?.thinking ??
+          (parsed.delta?.type === 'thinking_delta' ? (parsed.delta as any).thinking : undefined);
+        if (thinkingDelta) {
+          reasoningBuffer += thinkingDelta;
+          if (options?.onThought) {
+            options.onThought(thinkingDelta);
+          }
+        }
+        if (parsed.delta?.text) {
+          full += parsed.delta.text;
+          options?.onToken?.(parsed.delta.text);
+        } else if (parsed.type === 'content_block_start' && parsed.content_block?.text) {
+          full += parsed.content_block.text;
+          options?.onToken?.(parsed.content_block.text);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith('Anthropic stream error:')) {
+          throw err;
+        }
+        // ignore malformed frame or ping
+      }
+    };
+
+    try {
+      for await (const raw of response.body as AsyncIterable<Uint8Array>) {
+        buffer += decoder.decode(raw, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) processLine(line);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split(/\r?\n/)) processLine(line);
+      }
+      this.lastReasoning = reasoningBuffer || null;
+    } catch (err) {
+      throw sanitizeError(err, this.apiKey);
+    }
+    if (!this.lastFinishReason) {
+      this.lastFinishReason = 'end_turn';
+    }
+
+    return full;
+  }
+}
+
+export const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+
+/**
+ * Sanitizes a Gemini base URL: strips surrounding quotes, trims whitespace,
+ * removes trailing slashes, and falls back to Google Generative Language API endpoint.
+ */
+export function sanitizeGeminiBaseUrl(url?: string | null): string {
+  if (!url) return DEFAULT_GEMINI_BASE_URL;
+  const unquoted = url.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!unquoted) return DEFAULT_GEMINI_BASE_URL;
+  return unquoted.replace(/\/+$/, '');
+}
+
+/**
+ * Google Gemini provider (Generative Language API format).
+ */
+export class GeminiProvider implements LLMProvider {
+  readonly name = 'gemini';
+  private apiKey: string;
+  private baseUrl: string;
+  private currentModel: string;
+  private readonly retry: RetryOptions;
+  lastFinishReason: string | null = null;
+  lastReasoning: string | null = null;
+  /** True setelah endpoint menolak `thinkingConfig` (Fase 2: fallback prompt injection). */
+  private reasoningParamUnsupported = false;
+  private reasoningFallbackLog = new ReasoningFallbackLog();
+
+  constructor(cfg: Partial<AgentConfig> = {}, retry: RetryOptions = {}) {
+    this.apiKey = cfg.apiKey ?? process.env.GEMINI_API_KEY ?? getProductEnv('API_KEY') ?? process.env.OPENAI_API_KEY ?? '';
+    const rawBase = cfg.baseUrl || process.env.GEMINI_BASE_URL || '';
+    this.baseUrl = sanitizeGeminiBaseUrl(rawBase);
+    this.currentModel = cfg.model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+    this.retry = retry;
+  }
+
+  get isConfigured(): boolean {
+    return this.apiKey.length > 0 && this.baseUrl.length > 0 && this.currentModel.length > 0;
+  }
+
+  get model(): string {
+    return this.currentModel;
+  }
+
+  setModel(model: string): void {
+    this.currentModel = model.trim() || this.currentModel;
+  }
+
+  setCredentials(apiKey: string, baseUrl: string): void {
+    if (apiKey.trim()) this.apiKey = apiKey.trim();
+    if (baseUrl !== undefined) {
+      this.baseUrl = sanitizeGeminiBaseUrl(baseUrl);
+    }
+  }
+
+  private authHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': this.apiKey,
+    };
+  }
+
+  private buildEndpointUrl(endpoint: string, queryParams?: Record<string, string>): string {
+    const cleanBase = sanitizeGeminiBaseUrl(this.baseUrl);
+    const cleanEndpoint = endpoint.replace(/^\/+/, '');
+    const fullUrl = `${cleanBase}/${cleanEndpoint}`;
+    if (!queryParams || Object.keys(queryParams).length === 0) {
+      return fullUrl;
+    }
+    const searchParams = new URLSearchParams(queryParams);
+    return `${fullUrl}?${searchParams.toString()}`;
+  }
+
+  private async requestWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const retries = this.retry.retries ?? 2;
+    const base = this.retry.baseDelayMs ?? 1000;
+    const max = this.retry.maxDelayMs ?? 15_000;
+    const sleep =
+      this.retry.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    for (let attempt = 0; ; attempt += 1) {
+      if (init.signal?.aborted) {
+        throw init.signal.reason || new Error('Aborted');
+      }
+      const response = await fetch(url, init);
+      if (response.ok || attempt >= retries || !RETRYABLE_STATUSES.has(response.status)) {
+        return response;
+      }
+      const retryAfter = parseRetryAfterMs(response.headers.get('retry-after'));
+      await sleep(retryAfter ?? backoffDelay(attempt + 1, base, max));
+    }
+  }
+
+  async testConnection(): Promise<ConnectionResult> {
+    if (!this.isConfigured) {
+      return { ok: false, message: 'Gemini API key belum diatur — set GEMINI_API_KEY atau jalankan /login.' };
+    }
+    try {
+      const url = this.buildEndpointUrl(`/models/${this.currentModel}:generateContent`);
+      const response = await this.requestWithRetry(url, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+          generationConfig: { maxOutputTokens: 16 },
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Gemini API error ${response.status}: ${sanitizeSensitiveText(body.slice(0, 200), this.apiKey)}`);
+      }
+      return { ok: true, message: this.currentModel };
+    } catch (err) {
+      const sanitized = sanitizeError(err, this.apiKey);
+      return { ok: false, message: explainProviderError(sanitized) };
+    }
+  }
+
+  async listModels(): Promise<string[]> {
+    return [
+      'gemini-2.0-flash',
+      'gemini-1.5-pro',
+      'gemini-1.5-flash',
+    ];
+  }
+
+  async chat(messages: ContextMessage[], options?: ChatOptions): Promise<string> {
+    if (!this.isConfigured) {
+      throw new Error('Konfigurasi Gemini belum lengkap (API key kosong) — jalankan /login atau set GEMINI_API_KEY.');
+    }
+
+    const reasoningLevel = options?.reasoning ?? null;
+    const useNativeReasoning = Boolean(reasoningLevel) && !this.reasoningParamUnsupported;
+
+    const buildPayload = (withNative: boolean): Record<string, unknown> => {
+      // Fallback prompt injection: dipakai saat parameter native `thinkingConfig` tidak didukung.
+      const source =
+        reasoningLevel && !withNative ? withReasoningDirective(messages, reasoningLevel) : messages;
+      const systemParts: string[] = [];
+      const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+
+      for (const m of source) {
+        if (m.role === 'system') {
+          systemParts.push(m.content);
+        } else {
+          const role: 'user' | 'model' = m.role === 'assistant' ? 'model' : 'user';
+          if (contents.length > 0 && contents[contents.length - 1].role === role) {
+            contents[contents.length - 1].parts[0].text += '\n\n' + m.content;
+          } else {
+            contents.push({ role, parts: [{ text: m.content }] });
+          }
+        }
+      }
+
+      if (contents.length === 0) {
+        contents.push({ role: 'user', parts: [{ text: 'Hello' }] });
+      }
+
+      const payload: Record<string, unknown> = {
+        contents,
+        generationConfig: {
+          maxOutputTokens: options?.maxTokens ?? 2048,
+          temperature: options?.temperature ?? 0.3,
+        },
+      };
+      if (systemParts.length > 0) {
+        payload.systemInstruction = {
+          parts: [{ text: systemParts.join('\n\n') }],
+        };
+      }
+      if (withNative && reasoningLevel) {
+        // Mapping PASTI Fase 2: field top-level `thinkingConfig: { thinkingBudget }` (clamped 0–24576).
+        payload.thinkingConfig = { thinkingBudget: toGeminiThinkingBudget(reasoningLevel) };
+      }
+      return payload;
+    };
+
+    const modelName = options?.model ?? this.currentModel;
+    const url = this.buildEndpointUrl(`/models/${modelName}:streamGenerateContent`, { alt: 'sse' });
+
+    let response: Response;
+    try {
+      response = await this.requestWithRetry(url, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: JSON.stringify(buildPayload(useNativeReasoning)),
+        signal: options?.signal,
+      });
+
+      // Model/endpoint menolak `thinkingConfig` (mis. seri tanpa thinking):
+      // JANGAN gagalkan request — strip parameter native, retry SEKALI dengan
+      // fallback prompt injection, lalu log sekali di level debug.
+      if (!response.ok && useNativeReasoning && reasoningLevel && response.status === 400) {
+        const errBody = await response.text();
+        if (/thinking/i.test(errBody)) {
+          this.reasoningParamUnsupported = true;
+          this.reasoningFallbackLog.note('thinkingConfig.thinkingBudget');
+          response = await this.requestWithRetry(url, {
+            method: 'POST',
+            headers: this.authHeaders(),
+            body: JSON.stringify(buildPayload(false)),
+            signal: options?.signal,
+          });
+        } else {
+          throw new Error(`Gemini API error ${response.status}: ${sanitizeSensitiveText(errBody.slice(0, 500), this.apiKey)}`);
+        }
+      }
+    } catch (err) {
+      throw sanitizeError(err, this.apiKey);
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Gemini API error ${response.status}: ${sanitizeSensitiveText(body.slice(0, 500), this.apiKey)}`);
+    }
+
+    this.lastFinishReason = null;
+    this.lastReasoning = null;
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('text/event-stream') || !response.body) {
+      try {
+        const data = (await response.json()) as {
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string; thought?: boolean | string }> };
+            finishReason?: string;
+          }>;
+        };
+        this.lastFinishReason = data.candidates?.[0]?.finishReason ?? 'STOP';
+        let reasoningBuffer = '';
+        let full = '';
+        const parts = data.candidates?.[0]?.content?.parts ?? [];
+        for (const part of parts) {
+          if (typeof part.thought === 'string' && part.thought) {
+            reasoningBuffer += part.thought;
+            options?.onThought?.(part.thought);
+            if (part.text && part.text !== part.thought) {
+              full += part.text;
+              options?.onToken?.(part.text);
+            }
+          } else if (part.thought === true && part.text) {
+            reasoningBuffer += part.text;
+            options?.onThought?.(part.text);
+          } else if (part.text) {
+            full += part.text;
+            options?.onToken?.(part.text);
+          }
+        }
+        this.lastReasoning = reasoningBuffer || null;
+        return full;
+      } catch (err) {
+        throw sanitizeError(err, this.apiKey);
+      }
+    }
+
+    let full = '';
+    let buffer = '';
+    let reasoningBuffer = '';
+    const decoder = new TextDecoder();
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const payloadStr = trimmed.slice(5).trim();
+      if (!payloadStr) return;
+      try {
+        const parsed = JSON.parse(payloadStr) as {
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string; thought?: boolean | string }> };
+            finishReason?: string;
+          }>;
+        };
+        const finishReason = parsed.candidates?.[0]?.finishReason;
+        if (finishReason) {
+          this.lastFinishReason = finishReason;
+        }
+        const parts = parsed.candidates?.[0]?.content?.parts ?? [];
+        for (const part of parts) {
+          if (typeof part.thought === 'string' && part.thought) {
+            reasoningBuffer += part.thought;
+            options?.onThought?.(part.thought);
+            if (part.text && part.text !== part.thought) {
+              full += part.text;
+              options?.onToken?.(part.text);
+            }
+          } else if (part.thought === true && part.text) {
+            reasoningBuffer += part.text;
+            options?.onThought?.(part.text);
+          } else if (part.text) {
+            full += part.text;
+            options?.onToken?.(part.text);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      for await (const raw of response.body as AsyncIterable<Uint8Array>) {
+        buffer += decoder.decode(raw, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) processLine(line);
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split(/\r?\n/)) processLine(line);
+      }
+    } catch (err) {
+      throw sanitizeError(err, this.apiKey);
+    }
+    if (!this.lastFinishReason) {
+      this.lastFinishReason = 'STOP';
+    }
+    this.lastReasoning = reasoningBuffer || null;
+
+    return full;
+  }
+}
+
+/** Factory: returns the configured provider (extend here for more backends). */
+export function createProvider(
+  config: Partial<AgentConfig> = {},
+  retry: RetryOptions = {},
+): LLMProvider {
+  const provider = (config.provider || '').toLowerCase();
+  const rawBase = (config.baseUrl || '').toLowerCase().replace(/^["'`]+|["'`]+$/g, '').trim();
+  const model = (config.model || '').toLowerCase();
+  if (provider === 'anthropic' || isHostnameOrSubdomain(rawBase, 'anthropic.com') || model.startsWith('claude-')) {
+    return new AnthropicProvider(config, retry);
+  }
+  if (provider === 'gemini' || isHostnameOrSubdomain(rawBase, 'googleapis.com') || (!rawBase && model.startsWith('gemini-'))) {
+    return new GeminiProvider(config, retry);
+  }
+  return new OpenAiCompatibleProvider(config, retry);
+}
