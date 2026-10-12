@@ -39,7 +39,7 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "@babel/parser": "^7.28.5",
+    "@babel/parser": "^8.0.7",
     "@vscode/ripgrep": "^1.18.0",
     "diff": "^8.0.3"
   }
