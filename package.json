@@ -41,6 +41,6 @@
   "dependencies": {
     "@babel/parser": "^7.28.5",
     "@vscode/ripgrep": "^1.18.0",
-    "diff": "^8.0.3"
+    "diff": "^9.0.0"
   }
 }
